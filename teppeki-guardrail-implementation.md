@@ -10,7 +10,7 @@
                                         ↓ mask
                                     [Presidio + GiNZA]
                                         ↓ store mapping
-                                    [Cloud Memorystore]
+                                    [Upstash Redis]
                                         ↓ call LLM
                                     [Gemini / OpenAI / Anthropic]
                                         ↓ unmask response
@@ -20,8 +20,8 @@
 **基本方針:**
 - プロキシ側でLLM応答を完全バッファリングし、アンマスク後にJSONで返す
 - フロントエンド（Next.js）側でReadableStreamを使ってタイプライター効果を模擬
-- Redis（Cloud Memorystore）でセッション（conversation_id）ごとのPIIマッピングを管理
-- min-instances=1 でコールドスタート（GiNZAモデルロード3〜8秒）を回避
+- Redis（Upstash）でセッション（conversation_id）ごとのPIIマッピングを管理（VPC 不要、0 リクエスト時はほぼ $0）
+- min-instances=0 でコスト削減（初回リクエストで 3〜8 秒のコールドスタートあり）
 
 ---
 
@@ -94,6 +94,10 @@ ja-ginza-electra==5.2.0
 
 # Redis
 redis[hiredis]==5.2.0
+upstash-redis>=1.0.0
+
+# PII 暗号化（Upstash 保存時）
+cryptography>=42.0.0
 
 # LLM
 litellm==1.52.0
@@ -113,9 +117,13 @@ python-dotenv==1.0.1
 # 認証
 TEPPEKI_PROXY_API_KEY=your-secret-api-key-here
 
-# Redis（Cloud Memorystore）
-REDIS_HOST=10.0.0.x
-REDIS_PORT=6379
+# Redis（Upstash）
+UPSTASH_REDIS_REST_URL=https://xxx.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your-upstash-token
+# Upstash 保存時の暗号化（推奨）: PII マッピングを AES 暗号化して保存
+# 生成: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode(), end='')"
+# PII_MAPPING_ENCRYPTION_KEY=your-fernet-key
+# ローカル開発: 未設定時は REDIS_HOST=localhost, REDIS_PORT=6379
 REDIS_TTL_SECONDS=86400   # 24時間
 
 # LLMプロバイダー
@@ -171,9 +179,9 @@ class ChatResponse(BaseModel):
 ## 6. `app/auth.py`
 
 ```python
+import hmac
 import os
 from fastapi import Header, HTTPException, status
-
 
 PROXY_API_KEY = os.environ["TEPPEKI_PROXY_API_KEY"]
 
@@ -186,7 +194,7 @@ async def verify_api_key(authorization: str = Header(...)):
             detail="Authorization header must start with 'Bearer '",
         )
     token = authorization.removeprefix("Bearer ").strip()
-    if token != PROXY_API_KEY:
+    if not hmac.compare_digest(token, PROXY_API_KEY):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -197,57 +205,84 @@ async def verify_api_key(authorization: str = Header(...)):
 
 ## 7. `app/redis_client.py`
 
+Upstash 使用時、`PII_MAPPING_ENCRYPTION_KEY` を設定すると **保存時のみ暗号化** する。復号は読み込み時のみ。UX（マスキングのビフォーアフター）に変化はない。鍵が設定されているが無効な場合は起動時に `ValueError` で失敗する。
+
 ```python
+"""
+PII mapping storage: Upstash Redis (production) or local Redis (development).
+"""
+import base64
 import json
 import os
-import redis.asyncio as aioredis
+from cryptography.fernet import Fernet, InvalidToken
 
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
-REDIS_TTL = int(os.environ.get("REDIS_TTL_SECONDS", 86400))  # 24h
+REDIS_TTL = int(os.environ.get("REDIS_TTL_SECONDS", 86400))
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+ENCRYPTION_KEY = os.environ.get("PII_MAPPING_ENCRYPTION_KEY")
+
+if UPSTASH_URL and UPSTASH_TOKEN:
+    from upstash_redis.asyncio import Redis
+    _redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+    _use_upstash = True
+else:
+    import redis.asyncio as aioredis
+    REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
+    REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+    _redis = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    _use_upstash = False
+
+if ENCRYPTION_KEY and _use_upstash:
+    key_bytes = ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY
+    try:
+        _fernet = Fernet(key_bytes)
+    except Exception:
+        if len(key_bytes) == 32:
+            try:
+                _fernet = Fernet(base64.urlsafe_b64encode(key_bytes))
+            except Exception:
+                _fernet = None
+        else:
+            _fernet = None
+    if _fernet is None:
+        raise ValueError("PII_MAPPING_ENCRYPTION_KEY is set but invalid.")
+else:
+    _fernet = None
 
 
-def _make_redis():
-    return aioredis.Redis(
-        host=REDIS_HOST,
-        port=REDIS_PORT,
-        decode_responses=True,
-    )
+def _encrypt(plain: str) -> str:
+    if _fernet is None:
+        return plain
+    return _fernet.encrypt(plain.encode()).decode()
 
 
-redis_client = _make_redis()
+def _decrypt(cipher: str) -> str:
+    if _fernet is None:
+        return cipher
+    try:
+        return _fernet.decrypt(cipher.encode()).decode()
+    except (InvalidToken, ValueError):
+        return cipher  # 移行前の平文データ
 
 
-def _pii_key(conversation_id: str) -> str:
-    """
-    Redisキー: pii:conv:{conversation_id}
-    conversation_id（Supabase UUID）をスコープとして使用。
-    """
+def _key(conversation_id: str) -> str:
     return f"pii:conv:{conversation_id}"
 
 
 async def load_pii_mapping(conversation_id: str) -> dict[str, str] | None:
-    """
-    既存のPIIマッピングを取得。
-    - キーが存在する場合: dict を返す（空dictも含む）
-    - キーが存在しない（TTL失効含む）: None を返す
-    """
-    key = _pii_key(conversation_id)
-    raw = await redis_client.get(key)
+    raw = await _redis.get(_key(conversation_id))
     if raw is None:
         return None
-    return json.loads(raw)
+    return json.loads(_decrypt(raw))
 
 
 async def save_pii_mapping(conversation_id: str, mapping: dict[str, str]) -> None:
-    """PIIマッピングを保存し、TTLをリセット（ターンごとに延長）。"""
-    key = _pii_key(conversation_id)
-    await redis_client.set(key, json.dumps(mapping, ensure_ascii=False), ex=REDIS_TTL)
+    plain = json.dumps(mapping, ensure_ascii=False)
+    await _redis.set(_key(conversation_id), _encrypt(plain), ex=REDIS_TTL)
 
 
 async def delete_pii_mapping(conversation_id: str) -> None:
-    """会話終了時などにPIIマッピングを削除。"""
-    await redis_client.delete(_pii_key(conversation_id))
+    await _redis.delete(_key(conversation_id))
 ```
 
 > **競合状態の対策:** 同一会話への同時リクエストは想定しない（チャットUIはリクエスト完了まで次の送信をブロック）。もし必要な場合は `redis_client.setnx` + Luaスクリプトで楽観的ロックを実装してください。
@@ -464,23 +499,20 @@ gcloud run deploy teppeki-guardrail \
   --image asia-northeast1-docker.pkg.dev/YOUR_PROJECT/teppeki/guardrail:latest \
   --region asia-northeast1 \
   --platform managed \
-  --min-instances 1 \          # GiNZAコールドスタート回避
-  --max-instances 10 \
+  --min-instances 0 \          # コスト削減。初回で 3〜8 秒コールドスタート
+  --max-instances 2 \          # 100 users 規模に最適化
   --memory 2Gi \               # GiNZAモデルに2GB必要
   --cpu 2 \
   --timeout 120 \
   --concurrency 80 \
   --no-allow-unauthenticated \ # Cloud Run IAM認証は不要（APIキーで管理）
-  --set-env-vars "REDIS_HOST=10.0.0.x,REDIS_PORT=6379,MAX_HISTORY_MESSAGES=20" \
-  --set-secrets "TEPPEKI_PROXY_API_KEY=teppeki-proxy-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest" \
-  --vpc-connector your-vpc-connector  # Cloud MemorystoreへのVPCアクセス
+  --set-env-vars "UPSTASH_REDIS_REST_URL=<YOUR_UPSTASH_URL>,MAX_HISTORY_MESSAGES=20" \
+  --set-secrets "TEPPEKI_PROXY_API_KEY=teppeki-proxy-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest,UPSTASH_REDIS_REST_TOKEN=upstash-redis-token:latest,PII_MAPPING_ENCRYPTION_KEY=pii-encryption-key:latest"
 ```
 
-> **Cloud Memorystore（Redis）設定:**
-> - バージョン: Redis 7.x
-> - ティア: Basic（開発）/ Standard（本番）
-> - VPCネットワーク: teppeki-guardrail と同じVPC
-> - Cloud Run は VPC Connector 経由でアクセス
+> **Upstash Redis 設定:** [console.upstash.com](https://console.upstash.com/) でデータベースを作成し、REST URL と Token を取得。VPC Connector 不要（HTTPS でアクセス）。
+
+> **Upstash 保存時の暗号化（推奨）:** `PII_MAPPING_ENCRYPTION_KEY` を設定すると、PII マッピング（`{"<PERSON_1>": "田中太郎", ...}`）を Upstash に送る直前で AES 暗号化し、読み込み時に復号する。Upstash 側に保存されるのは暗号文のみ。UX（マスキングのビフォーアフター、応答内容）への影響はない。鍵生成: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode(), end='')"`
 
 ---
 
@@ -618,8 +650,10 @@ pip install -r requirements.txt
 # 2. GiNZAモデルダウンロード（初回のみ）
 python -m spacy download ja_ginza_electra
 
-# 3. Redis（Dockerで起動）
+# 3. Redis（ローカル開発）
+# オプション A: docker redis（REDIS_HOST 未設定時は localhost がデフォルト）
 docker run -d -p 6379:6379 redis:7-alpine
+# オプション B: Upstash の URL/Token を .env に設定
 
 # 4. 環境変数設定
 cp .env.example .env
@@ -645,8 +679,8 @@ curl -X POST http://localhost:8080/chat \
 
 - [ ] `TEPPEKI_PROXY_API_KEY` は Secret Manager で管理（平文コミット禁止）
 - [ ] Cloud Run は `--no-allow-unauthenticated`（APIキー認証のみ）
-- [ ] Redis は VPC 内のみアクセス可（パブリックエンドポイント無効）
-- [ ] Redis の `in-transit encryption` を有効化（Cloud Memorystore標準設定）
+- [ ] Upstash Redis のトークンは Secret Manager で管理（本番環境推奨）
+- [ ] `PII_MAPPING_ENCRYPTION_KEY` を設定し、Upstash 保存時の暗号化を有効化（推奨）
 - [ ] LLM APIキーはすべて Secret Manager で管理
 - [ ] Cloud Run ログに PII が出力されていないことを確認（structuredログ + フィールド除外）
 
@@ -660,8 +694,9 @@ curl -X POST http://localhost:8080/chat \
 4. **`app/redis_client.py`** — ローカルRedisで動作確認
 5. **`app/llm_client.py`** — LiteLLMでGemini疎通確認
 6. **`app/main.py`** — `/chat` エンドポイント統合テスト
-7. **Cloud Run デプロイ** — min-instances=1 を確認
-8. **Next.js 側の `route.ts` 変更** — E2Eテスト
+7. **Upstash Redis 作成** — Console で URL/Token 取得
+8. **Cloud Run デプロイ** — VPC 不要、min-instances=0, max-instances=2
+9. **Next.js 側の `route.ts` 変更** — E2Eテスト
 
 ---
 

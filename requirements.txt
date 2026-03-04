@@ -10,6 +10,7 @@ ja-ginza-electra==5.2.0
 
 # Redis
 redis[hiredis]==5.2.0
+upstash-redis>=1.0.0
 
 # LLM
 litellm==1.52.0
@@ -17,3 +18,4 @@ litellm==1.52.0
 # Utilities
 pydantic==2.9.0
 python-dotenv==1.0.1
+cryptography>=42.0.0

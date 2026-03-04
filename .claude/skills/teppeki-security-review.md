@@ -22,7 +22,7 @@ Activate when: the user asks about security, PII safety, data flow auditing, com
 
 ### Attack Surface
 ```
-Internet → Cloud Run (auth layer) → FastAPI app → Redis (VPC-internal)
+Internet → Cloud Run (auth layer) → FastAPI app → Upstash Redis (HTTPS)
                                                → LLM Provider (external)
                                                → Application logs
 ```
@@ -45,7 +45,7 @@ Internet → Cloud Run (auth layer) → FastAPI app → Redis (VPC-internal)
 [5] LLM response contains placeholders          → No PII in LLM response
 [6] Unmasking: placeholder → original           → In-memory only
 [7] Unmasked response sent to Next.js           → HTTPS encrypted in transit
-[8] PII mapping saved to Redis                  → VPC-internal, in-transit encryption
+[8] PII mapping saved to Redis                  → Upstash; encrypted if PII_MAPPING_ENCRYPTION_KEY set
 ```
 
 ### Critical Verification Points
@@ -79,15 +79,15 @@ if msg.role in ("user", "assistant"):
 If only `user` is masked, assistant messages containing unmasked PII from previous turns would leak to the LLM.
 
 ### Network Security
-- [ ] Cloud Memorystore has no public IP (VPC-internal only)
-- [ ] In-transit encryption enabled on Memorystore
-- [ ] VPC Connector properly configured (Cloud Run → Memorystore)
-- [ ] No other services can access Memorystore without VPC access
+- [ ] Upstash Redis accessed via HTTPS only
+- [ ] `PII_MAPPING_ENCRYPTION_KEY` set for at-rest encryption in Upstash (recommended)
 - [ ] Cloud Run ingress set to `all` (public) but auth required via API key
 
 ### Secrets Management
 - [ ] `TEPPEKI_PROXY_API_KEY` — Secret Manager, never in `.env` committed to git
 - [ ] `GEMINI_API_KEY` — Secret Manager
+- [ ] `UPSTASH_REDIS_REST_TOKEN` — Secret Manager (recommended)
+- [ ] `PII_MAPPING_ENCRYPTION_KEY` — Secret Manager (recommended for Upstash)
 - [ ] `OPENAI_API_KEY` — Secret Manager (if used)
 - [ ] `ANTHROPIC_API_KEY` — Secret Manager (if used)
 - [ ] `.env` and `.env.local` in `.gitignore`
@@ -160,8 +160,8 @@ When reviewing any PR that touches the masking/unmasking pipeline:
 4. Fix the code and deploy hotfix
 5. Notify affected users per privacy policy
 
-### Redis Failure
+### Redis (Upstash) Failure
 1. All active conversations get 409 on next turn → automatic recovery
 2. Users start new conversations → no data loss (conversations stored in Supabase)
-3. Fix Redis / restore Memorystore
+3. Check Upstash status; verify URL/Token; retry
 4. No PII permanently lost (Redis is a cache, not source of truth)

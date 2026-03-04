@@ -109,6 +109,7 @@ Return ChatResponse
 ## Auth Pattern
 
 ```python
+import hmac
 from fastapi import Header, HTTPException, status
 
 PROXY_API_KEY = os.environ["TEPPEKI_PROXY_API_KEY"]
@@ -117,13 +118,13 @@ async def verify_api_key(authorization: str = Header(...)) -> None:
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Authorization header must start with 'Bearer '")
     token = authorization.removeprefix("Bearer ").strip()
-    if token != PROXY_API_KEY:
+    if not hmac.compare_digest(token, PROXY_API_KEY):
         raise HTTPException(status_code=401, detail="Invalid API key")
 ```
 
 - Injected via `dependencies=[Depends(verify_api_key)]` on the endpoint
 - Uses FastAPI's dependency injection — no middleware needed
-- Constant-time comparison should be used in production (`hmac.compare_digest`)
+- Uses `hmac.compare_digest` for constant-time comparison (timing-attack resistant)
 
 ## Error Handling Strategy
 

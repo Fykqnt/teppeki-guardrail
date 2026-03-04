@@ -13,16 +13,15 @@ gcloud run deploy teppeki-guardrail \
   --image      asia-northeast1-docker.pkg.dev/$PROJECT/teppeki/guardrail:latest \
   --region     asia-northeast1 \
   --platform   managed \
-  --min-instances 1 \
-  --max-instances 10 \
+  --min-instances 0 \
+  --max-instances 2 \
   --memory     2Gi \
   --cpu        2 \
   --timeout    120 \
   --concurrency 80 \
   --no-allow-unauthenticated \
-  --set-env-vars "REDIS_HOST=$MEMORYSTORE_IP,REDIS_PORT=6379,MAX_HISTORY_MESSAGES=20" \
-  --set-secrets "TEPPEKI_PROXY_API_KEY=teppeki-proxy-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest" \
-  --vpc-connector teppeki-connector
+  --set-env-vars "UPSTASH_REDIS_REST_URL=$UPSTASH_URL,MAX_HISTORY_MESSAGES=20" \
+  --set-secrets "TEPPEKI_PROXY_API_KEY=teppeki-proxy-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest,UPSTASH_REDIS_REST_TOKEN=upstash-redis-token:latest,PII_MAPPING_ENCRYPTION_KEY=pii-encryption-key:latest"
 ```
 
 ## Resource Sizing Rationale
@@ -31,8 +30,8 @@ gcloud run deploy teppeki-guardrail \
 |-----------|-------|-----------|
 | `memory` | 2Gi | GiNZA (ja_ginza_electra) model ~1.5GB + app overhead |
 | `cpu` | 2 | Presidio NLP pipeline is CPU-bound; 2 vCPUs for concurrent masking |
-| `min-instances` | 1 | GiNZA cold start = 3-8s; keeping one warm instance eliminates this |
-| `max-instances` | 10 | Burst capacity; each instance handles 80 concurrent requests |
+| `min-instances` | 0 | Cost optimization; cold start 3-8s on first request |
+| `max-instances` | 2 | 100 users scale; each instance handles 80 concurrent requests |
 | `timeout` | 120s | LLM full-buffering can take 10-30s; add safety margin |
 | `concurrency` | 80 | FastAPI async handles I/O-bound LLM calls efficiently; CPU work (masking) is brief per request |
 
@@ -68,43 +67,25 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
 3. Use `--no-cache-dir` for pip to reduce image size
 4. Use `python:3.12-slim` (not alpine — native binary deps compile faster)
 
-## VPC Networking
+## Redis (Upstash)
 
 ```
 Cloud Run (asia-northeast1)
     │
-    │ VPC Connector (teppeki-connector, 10.8.0.0/28)
+    │ HTTPS (no VPC needed)
     │
     ▼
-Cloud Memorystore Redis (VPC-internal IP, e.g. 10.0.0.x)
+Upstash Redis (REST API, serverless)
 ```
 
-### Setup Commands
-```bash
-# 1. Create Memorystore instance
-gcloud redis instances create teppeki-redis \
-  --size=1 --region=asia-northeast1 \
-  --redis-version=redis_7_0 \
-  --tier=basic \    # standard for production (replication)
-  --network=default
+### Setup
+1. Create database at [console.upstash.com](https://console.upstash.com/)
+2. Copy REST URL and Token to Secret Manager
+3. Set `PII_MAPPING_ENCRYPTION_KEY` for at-rest encryption (recommended)
 
-# 2. Create VPC Connector
-gcloud compute networks vpc-access connectors create teppeki-connector \
-  --region=asia-northeast1 \
-  --network=default \
-  --range=10.8.0.0/28
-
-# 3. Get Redis IP
-gcloud redis instances describe teppeki-redis \
-  --region=asia-northeast1 --format="value(host)"
-```
-
-### Networking Checklist
-- [ ] VPC Connector in same region as Cloud Run AND Memorystore
-- [ ] Memorystore has NO public IP (VPC-internal only)
-- [ ] In-transit encryption enabled on Memorystore
-- [ ] Firewall rules allow VPC Connector subnet → Redis port 6379
-- [ ] Cloud Run service account has `roles/redis.editor` (if using Auth)
+### Checklist
+- [ ] Upstash REST URL and Token in env vars or Secret Manager
+- [ ] `PII_MAPPING_ENCRYPTION_KEY` set for PII mapping encryption (recommended)
 
 ## Secret Manager Integration
 
@@ -133,7 +114,7 @@ async def health():
     return {"status": "ok"}
 ```
 - Cloud Run uses this for liveness probes
-- Consider adding Redis connectivity check for readiness
+- Consider adding Upstash ping for readiness (separate `/ready` endpoint)
 
 ### Key Metrics to Monitor
 | Metric | Alert Threshold | Action |
@@ -142,8 +123,8 @@ async def health():
 | Instance count | Sustained at max | Increase `max-instances` |
 | Memory utilization | > 80% | Increase memory allocation |
 | 5xx error rate | > 1% | Check LLM provider status; inspect logs |
-| Cold start count | > 0/hour | Verify `min-instances=1` is active |
-| Redis connection errors | Any | Check VPC Connector health; Memorystore status |
+| Cold start count | > 0/hour | Expected with `min-instances=0`; consider min=1 for low latency |
+| Upstash errors | Any | Check Upstash status; verify URL/Token |
 
 ### Structured Logging
 ```python
@@ -179,17 +160,16 @@ logger.info(
    - Health check returns 200
    - Test request with sample PII returns masked/unmasked correctly
    - Check Cloud Logging for errors
-   - Verify min-instances warmup completed (GiNZA model loaded)
+   - With min-instances=0, first request may take 3-8s (GiNZA cold start)
 ```
 
 ## Cost Optimization
 
 | Component | Estimated Monthly Cost | Optimization |
 |-----------|----------------------|--------------|
-| Cloud Run (min-instances=1) | ~$30-50 | Acceptable for always-warm; consider scaling to 0 in dev |
-| Cloud Memorystore Basic 1GB | ~$35 | Use smallest tier; data is ephemeral (TTL 24h) |
-| VPC Connector | ~$7 | Shared across services if possible |
+| Cloud Run (min-instances=0) | ~$5-15 (100 users) | Pay per request; ~$0 when idle |
+| Upstash Redis | ~$0 (free tier 500K cmd/mo) | Serverless; no fixed cost |
 | Artifact Registry | ~$1-5 | Clean old images periodically |
 | Secret Manager | ~$0.06/secret/mo | Negligible |
 
-**Total baseline**: ~$75-100/month for production-ready setup
+**Total baseline**: ~$10-25/month for 100 users; ~$2-5 when idle
