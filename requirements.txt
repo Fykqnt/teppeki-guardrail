@@ -14,6 +14,8 @@ upstash-redis>=1.0.0
 
 # LLM
 litellm==1.52.0
+# cp312 wheel あり（Rust ビルド回避）。litellm が 0.13.x を引くため明示
+tokenizers>=0.15.0
 
 # Utilities
 pydantic==2.9.0
