@@ -9,7 +9,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str = Field(..., description="Supabase chat.id（UUID v4）")
     messages: list[Message] = Field(..., min_length=1)
-    model: str = Field(default="gemini/gemini-3-flash-preview")
+    model: str = Field(default="gemini-3-flash-preview")
 
 
 class TokenUsage(BaseModel):

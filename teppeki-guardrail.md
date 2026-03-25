@@ -148,7 +148,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str = Field(..., description="Supabase chat.id（UUID v4）")
     messages: list[Message] = Field(..., min_length=1)
-    model: str = Field(default="gemini/gemini-3-flash-preview")
+    model: str = Field(default="gemini-3-flash-preview")
 
 
 class TokenUsage(BaseModel):
@@ -681,11 +681,11 @@ gcloud run deploy teppeki-guardrail \
   --platform   managed \
   --min-instances 0 \                # コスト削減。初回リクエストで 3〜8 秒のコールドスタートあり
   --max-instances 2 \                # 100 users 規模に最適化
-  --memory     2Gi \                # GiNZA モデルに 2GB 必要
+  --memory     4Gi \                # GiNZA + warmup で 2Gi を超えるため 4Gi 推奨
   --cpu        2 \
   --timeout    120 \                # LLM バッファリングに備えて 120 秒
   --concurrency 80 \
-  --no-allow-unauthenticated \      # 認証は API キーで管理
+  --allow-unauthenticated \         # Cloud Run IAM ではなく FastAPI の API キーで保護
   --set-env-vars \
     "UPSTASH_REDIS_REST_URL=<YOUR_UPSTASH_URL>,MAX_HISTORY_MESSAGES=20" \
   --set-secrets \
@@ -696,6 +696,37 @@ gcloud run deploy teppeki-guardrail \
 ```
 
 > **VPC Connector が不要:** Upstash は HTTPS でアクセスするため、VPC 不要。月約 $65 削減。
+
+> **認証境界:** Cloud Run は unauthenticated 許可にし、認証は `app/auth.py` の `Authorization: Bearer <TEPPEKI_PROXY_API_KEY>` で行う。Google / Cloud Run 由来の HTML 401 が返る場合は、FastAPI まで到達せず Cloud Run IAM でブロックされている。
+
+既存サービスを更新して unauthenticated 許可にする場合:
+
+```bash
+gcloud run services add-iam-policy-binding teppeki-guardrail \
+  --region asia-northeast1 \
+  --member="allUsers" \
+  --role="roles/run.invoker"
+```
+
+Cloud Run の入口確認:
+
+```bash
+curl -i "https://<GUARDRAIL_URL>/chat" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <TEPPEKI_PROXY_API_KEY>" \
+  -d '{
+    "conversation_id": "test-1",
+    "messages": [
+      {"role": "user", "content": "田中太郎です。090-1234-5678です。"}
+    ],
+    "model": "gemini-3-flash-preview"
+  }'
+```
+
+期待する結果:
+- 成功時は FastAPI 由来の JSON レスポンス
+- API キー不正時は FastAPI 由来の JSON 401
+- Google / Cloud Run 由来の HTML 401 は返らない
 
 > **Secret Manager に登録しておくシークレット:**
 > ```bash
@@ -744,7 +775,7 @@ curl -s -X POST http://localhost:8080/chat \
       {"role": "system",    "content": "あなたは丁寧なアシスタントです。"},
       {"role": "user",      "content": "田中太郎です。090-1234-5678に電話してください。"}
     ],
-    "model": "gemini/gemini-3-flash-preview"
+    "model": "gemini-3-flash-preview"
   }' | jq .
 ```
 
@@ -752,6 +783,14 @@ curl -s -X POST http://localhost:8080/chat \
 ```json
 {
   "reply": "田中太郎様、090-1234-5678 にご連絡いたします。",
+  "input_text": {
+    "masked": "<PERSON_1>です。<PHONE_NUMBER_1>に電話してください。",
+    "unmasked": "田中太郎です。090-1234-5678に電話してください。"
+  },
+  "reply_text": {
+    "masked": "<PERSON_1>様、<PHONE_NUMBER_1> にご連絡いたします。",
+    "unmasked": "田中太郎様、090-1234-5678 にご連絡いたします。"
+  },
   "pii_summary": {
     "pii_count": 2,
     "entity_types": ["PERSON", "PHONE_NUMBER"],
@@ -765,11 +804,12 @@ curl -s -X POST http://localhost:8080/chat \
 ## 14. セキュリティチェックリスト
 
 - [ ] `TEPPEKI_PROXY_API_KEY` は Secret Manager で管理（`.env` はコミットしない）
-- [ ] Cloud Run は `--no-allow-unauthenticated`（直接アクセス不可）
+- [ ] Cloud Run は `--allow-unauthenticated` にし、認証境界は FastAPI の Bearer secret に統一
 - [ ] Upstash Redis のトークンは Secret Manager で管理（本番環境推奨）
 - [ ] `PII_MAPPING_ENCRYPTION_KEY` を設定し、Upstash 保存時の暗号化を有効化（推奨）
 - [ ] LLM API キーはすべて Secret Manager で管理
 - [ ] Cloud Run のリクエストログに PII が含まれないことを確認（`LOG_LEVEL=INFO` でリクエストボディは非出力）
+- [ ] `/chat` への直接 `curl` で HTML 401 ではなく FastAPI の JSON が返ることを確認
 - [ ] Artifact Registry のイメージに対して `roles/artifactregistry.reader` のみ付与
 
 ---
@@ -808,14 +848,15 @@ chat-ui（Next.js）から呼び出す際のエンドポイント仕様:
 | **ヘルスチェック** | `GET /health` → `{ "status": "ok" }`（接続確認用） |
 | **認証** | `Authorization: Bearer <TEPPEKI_PROXY_API_KEY>` |
 | **リクエスト** | `{ conversation_id, messages, model }` |
-| **成功レスポンス** | `{ reply, pii_summary: { pii_count, entity_types, tokens_used } }` |
+| **成功レスポンス** | `{ reply, input_text: { masked, unmasked }, reply_text: { masked, unmasked }, pii_summary: { pii_count, entity_types, tokens_used } }` |
 | **401** | 認証失敗（API キー不正・欠落） |
 | **409 session_expired** | TTL 失効時。フロントエンドは会話リセットを促す |
 | **422** | メッセージ長超過（`detail` に `Message exceeds N chars`） |
 | **502** | LLM プロバイダーエラー |
 
 - **conversation_id:** Supabase `chat.id`（UUID v4）。新規会話作成時または既存会話継続時に取得。
-- **model:** LiteLLM 形式（例: `gemini/gemini-3-flash-preview`, `openai/gpt-4o`, `anthropic/claude-3-opus`）。
+- **model:** chat-ui から送られるモデル名をそのまま受け付ける（例: `gemini-3-flash-preview`, `gpt-5.2`, `claude-sonnet-4.5`）。guardrail 側で LiteLLM 形式に正規化する。すでに provider prefix 付きの値（例: `gemini/gemini-3-flash-preview`）もそのまま受け付ける。
+- **Cloud Run 認証:** Cloud Run IAM は要求しない。HTML 401 が返る場合は Cloud Run 側の unauthenticated 許可設定を確認する。
 
 Next.js 側の実装例・セッション失効ハンドリング・フェイクストリーミングは `teppeki-guardrail-implementation.md` セクション 12 を参照。
 

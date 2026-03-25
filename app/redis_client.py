@@ -19,10 +19,27 @@ UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 ENCRYPTION_KEY = os.environ.get("PII_MAPPING_ENCRYPTION_KEY")
 
+
+def _validate_upstash_url(url: str) -> str:
+    normalized = url.strip()
+    if not normalized:
+        raise ValueError("UPSTASH_REDIS_REST_URL is set but empty.")
+    if "<" in normalized or ">" in normalized:
+        raise ValueError(
+            "UPSTASH_REDIS_REST_URL still contains a placeholder. "
+            "Set it to the full https://... Upstash REST URL."
+        )
+    if not normalized.startswith(("http://", "https://")):
+        raise ValueError(
+            "UPSTASH_REDIS_REST_URL must start with http:// or https://."
+        )
+    return normalized
+
+
 if UPSTASH_URL and UPSTASH_TOKEN:
     from upstash_redis.asyncio import Redis
 
-    _redis = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
+    _redis = Redis(url=_validate_upstash_url(UPSTASH_URL), token=UPSTASH_TOKEN)
     _use_upstash = True
 else:
     import redis.asyncio as aioredis

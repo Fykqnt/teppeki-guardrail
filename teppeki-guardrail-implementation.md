@@ -163,7 +163,7 @@ class Message(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str = Field(..., description="Supabase chat.id（UUID v4）")
     messages: list[Message] = Field(..., min_length=1)
-    model: str = Field(default="gemini/gemini-3-flash-preview")
+    model: str = Field(default="gemini-3-flash-preview")
 
 
 class TokenUsage(BaseModel):
@@ -549,11 +549,11 @@ gcloud run deploy teppeki-guardrail \
   --platform managed \
   --min-instances 0 \          # コスト削減。初回で 3〜8 秒コールドスタート
   --max-instances 2 \          # 100 users 規模に最適化
-  --memory 2Gi \               # GiNZAモデルに2GB必要
+  --memory 4Gi \               # GiNZA + warmup で 2Gi を超えるため 4Gi 推奨
   --cpu 2 \
   --timeout 120 \
   --concurrency 80 \
-  --no-allow-unauthenticated \ # Cloud Run IAM認証は不要（APIキーで管理）
+  --allow-unauthenticated \    # Cloud Run IAM ではなく FastAPI の API キーで保護
   --set-env-vars "UPSTASH_REDIS_REST_URL=<YOUR_UPSTASH_URL>,MAX_HISTORY_MESSAGES=20" \
   --set-secrets "TEPPEKI_PROXY_API_KEY=teppeki-proxy-api-key:latest,GEMINI_API_KEY=gemini-api-key:latest,UPSTASH_REDIS_REST_TOKEN=upstash-redis-token:latest,PII_MAPPING_ENCRYPTION_KEY=pii-encryption-key:latest"
 ```
@@ -561,6 +561,17 @@ gcloud run deploy teppeki-guardrail \
 > **Upstash Redis 設定:** [console.upstash.com](https://console.upstash.com/) でデータベースを作成し、REST URL と Token を取得。VPC Connector 不要（HTTPS でアクセス）。
 
 > **Upstash 保存時の暗号化（推奨）:** `PII_MAPPING_ENCRYPTION_KEY` を設定すると、PII マッピング（`{"<PERSON_1>": "田中太郎", ...}`）を Upstash に送る直前で AES 暗号化し、読み込み時に復号する。Upstash 側に保存されるのは暗号文のみ。UX（マスキングのビフォーアフター、応答内容）への影響はない。鍵生成: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode(), end='')"`
+
+> **認証境界:** `teppeki-ai-chat` は Cloud Run IAM token を付与しない。Cloud Run は unauthenticated 許可にし、認証は FastAPI の `Authorization: Bearer <TEPPEKI_PROXY_API_KEY>` に統一する。Google / Cloud Run 由来の HTML 401 が返る場合は、FastAPI ではなく Cloud Run IAM の入口で弾かれている。
+
+既存サービスを unauthenticated 許可に変更する場合:
+
+```bash
+gcloud run services add-iam-policy-binding teppeki-guardrail \
+  --region asia-northeast1 \
+  --member="allUsers" \
+  --role="roles/run.invoker"
+```
 
 ---
 
@@ -614,7 +625,7 @@ export async function POST(req: NextRequest) {
   }
 
   // ── 2. リクエストパース ───────────────────────────────────────────────────
-  const { conversation_id, messages, model = 'gemini/gemini-3-flash-preview' } = await req.json()
+  const { conversation_id, messages, model = 'gemini-3-flash-preview' } = await req.json()
 
   if (!conversation_id || !messages?.length) {
     return new Response('Bad Request', { status: 400 })
@@ -669,8 +680,16 @@ export async function POST(req: NextRequest) {
   }
 
   // ── 9. JSONレスポンスをパース ─────────────────────────────────────────────
-  const { reply, pii_summary } = await proxyResponse.json() as {
+  const { reply, input_text, reply_text, pii_summary } = await proxyResponse.json() as {
     reply: string
+    input_text: {
+      masked: string
+      unmasked: string
+    }
+    reply_text: {
+      masked: string
+      unmasked: string
+    }
     pii_summary: {
       pii_count: number
       entity_types: string[]
@@ -720,7 +739,7 @@ TEPPEKI_PROXY_API_KEY=your-secret-api-key-here  # プロキシと同じ値
 | ヘルスチェック | `GET /health` → `{ "status": "ok" }`（接続確認用） |
 | 認証 | `Authorization: Bearer <TEPPEKI_PROXY_API_KEY>` |
 | リクエスト | `{ conversation_id, messages, model }` |
-| 成功レスポンス | `{ reply, pii_summary: { pii_count, entity_types, tokens_used } }` |
+| 成功レスポンス | `{ reply, input_text: { masked, unmasked }, reply_text: { masked, unmasked }, pii_summary: { pii_count, entity_types, tokens_used } }` |
 | 401 | 認証失敗（API キー不正・欠落） |
 | 409 session_expired | TTL 失効時。フロントエンドは会話リセットを促す |
 | 422 | メッセージ長超過 |
@@ -728,6 +747,7 @@ TEPPEKI_PROXY_API_KEY=your-secret-api-key-here  # プロキシと同じ値
 
 - **conversation_id:** Supabase `chat.id`（UUID v4）。新規会話作成時または既存会話継続時に取得。
 - **model:** LiteLLM 形式
+- **Cloud Run 認証:** Cloud Run IAM token は不要。HTML 401 が返る場合は Cloud Run の unauthenticated 許可設定を確認する。
 
 ### フロントエンド（chat-ui）での 409 session_expired ハンドリング
 
@@ -740,7 +760,7 @@ Next.js API route が 409 を返す場合、レスポンスボディは `{ error
 
 ### Supabase messages への保存
 
-guardrail はアンマスク済みの `reply` を返す。Next.js 側でストリーム完了後に、その `reply` を Supabase `messages` テーブルに `role: "assistant"` として保存する（既存の chat-ui ロジックを流用）。保存するのは**アンマスク済み**の生テキスト（ユーザーに表示する内容と同じ）。
+guardrail はアンマスク済みの `reply` に加えて、`input_text` / `reply_text` として masked / unmasked の両方を返す。Next.js 側でストリーム完了後に Supabase `messages` テーブルへ保存する本文は、従来どおり **アンマスク済み** の `reply` を使う。UI でビフォーアフター表示をしたい場合は `input_text.masked` / `input_text.unmasked` / `reply_text.masked` / `reply_text.unmasked` を利用する。
 
 ---
 
@@ -778,7 +798,7 @@ curl -X POST http://localhost:8080/chat \
   -d '{
     "conversation_id": "550e8400-e29b-41d4-a716-446655440000",
     "messages": [{"role": "user", "content": "田中太郎です。電話番号は090-1234-5678です。"}],
-    "model": "gemini/gemini-3-flash-preview"
+    "model": "gemini-3-flash-preview"
   }'
 ```
 
@@ -787,11 +807,12 @@ curl -X POST http://localhost:8080/chat \
 ## 14. セキュリティチェックリスト
 
 - [ ] `TEPPEKI_PROXY_API_KEY` は Secret Manager で管理（平文コミット禁止）
-- [ ] Cloud Run は `--no-allow-unauthenticated`（APIキー認証のみ）
+- [ ] Cloud Run は `--allow-unauthenticated` にし、認証境界は FastAPI の Bearer secret に統一
 - [ ] Upstash Redis のトークンは Secret Manager で管理（本番環境推奨）
 - [ ] `PII_MAPPING_ENCRYPTION_KEY` を設定し、Upstash 保存時の暗号化を有効化（推奨）
 - [ ] LLM APIキーはすべて Secret Manager で管理
 - [ ] Cloud Run ログに PII が出力されていないことを確認（structuredログ + フィールド除外）
+- [ ] `/chat` に直接 `curl` して Google / Cloud Run 由来の HTML 401 ではなく FastAPI の JSON が返ることを確認
 
 ---
 
