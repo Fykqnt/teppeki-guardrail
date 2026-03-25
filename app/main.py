@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from app.auth import verify_api_key
 from app.llm_client import call_llm
 from app.masking import redact_text_with_mapping, warmup
-from app.models import ChatRequest, ChatResponse, PIISummary
+from app.models import ChatRequest, ChatResponse, PIISummary, TextVariant
 from app.redis_client import load_pii_mapping, save_pii_mapping
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="teppeki-guardrail", lifespan=lifespan)
+
+
+def _unmask_text(text: str, pii_mapping: dict[str, str]) -> str:
+    unmasked_text = text
+    for placeholder, original in pii_mapping.items():
+        unmasked_text = unmasked_text.replace(placeholder, original)
+    return unmasked_text
 
 
 @app.get("/health")
@@ -76,6 +83,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     # ── 4. user・assistant を全件再マスク（system はそのまま通す）────────────
     masked_messages = []
+    latest_user_input = TextVariant(masked="", unmasked="")
     for msg in messages_to_process:
         if msg.role in ("user", "assistant"):
             masked_text, pii_mapping = redact_text_with_mapping(
@@ -83,6 +91,11 @@ async def chat(req: ChatRequest) -> ChatResponse:
                 existing_mapping=pii_mapping,
             )
             masked_messages.append(msg.model_copy(update={"content": masked_text}))
+            if msg.role == "user":
+                latest_user_input = TextVariant(
+                    masked=masked_text,
+                    unmasked=msg.content,
+                )
         else:
             masked_messages.append(msg)
 
@@ -104,9 +117,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
     await save_pii_mapping(req.conversation_id, pii_mapping)
 
     # ── 8. アンマスク ─────────────────────────────────────────────────────────
-    reply = masked_reply
-    for placeholder, original in pii_mapping.items():
-        reply = reply.replace(placeholder, original)
+    reply = _unmask_text(masked_reply, pii_mapping)
+    reply_text = TextVariant(masked=masked_reply, unmasked=reply)
 
     logger.info(
         f"conv={req.conversation_id} pii={len(pii_mapping)} "
@@ -115,6 +127,8 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     return ChatResponse(
         reply=reply,
+        input_text=latest_user_input,
+        reply_text=reply_text,
         pii_summary=PIISummary(
             pii_count=len(pii_mapping),
             entity_types=sorted(entity_types),

@@ -727,7 +727,7 @@ TEPPEKI_PROXY_API_KEY=your-secret-api-key-here  # プロキシと同じ値
 | 502 | LLM プロバイダーエラー |
 
 - **conversation_id:** Supabase `chat.id`（UUID v4）。新規会話作成時または既存会話継続時に取得。
-- **model:** LiteLLM 形式（例: `gemini/gemini-3-flash-preview`, `openai/gpt-4o`）。
+- **model:** LiteLLM 形式
 
 ### フロントエンド（chat-ui）での 409 session_expired ハンドリング
 

@@ -23,6 +23,13 @@ class PIISummary(BaseModel):
     tokens_used: TokenUsage
 
 
+class TextVariant(BaseModel):
+    masked: str
+    unmasked: str
+
+
 class ChatResponse(BaseModel):
     reply: str
+    input_text: TextVariant
+    reply_text: TextVariant
     pii_summary: PIISummary
